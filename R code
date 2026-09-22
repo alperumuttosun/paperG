@@ -1,0 +1,363 @@
+# ============================================================
+# GALLSTONE INFORMATION-ARCHITECTURE PAPER — ANA ANALIZ KODU
+# Versiyon: v4 (DUZELTME: figurlerde domain isimlerinden onekler
+#           kaldirildi - "B_Bioimpedance" -> "Bioimpedance" vs.
+#           Internal kod isimleri (domains listesi) degismedi.)
+# ============================================================
+
+# ---- 0. Kurulum ----
+rm(list = ls())
+base_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"
+proj_dir <- file.path(base_dir, "gallstonepaper")
+fig_dir  <- file.path(proj_dir, "figures")
+if (!dir.exists(proj_dir)) dir.create(proj_dir)
+if (!dir.exists(fig_dir))  dir.create(fig_dir)
+setwd(proj_dir)
+
+pkgs <- c("readxl", "glmnet", "xgboost", "ggplot2", "tidyr")
+to_install <- pkgs[!pkgs %in% installed.packages()[, "Package"]]
+if (length(to_install) > 0) install.packages(to_install)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+set.seed(2026)
+
+# ---- 1. Veri yukleme ----
+data_path <- file.path(base_dir, "gallstone.xlsx")
+df <- as.data.frame(readxl::read_excel(data_path))
+target <- "Gallstone Status"
+y <- as.numeric(df[[target]])
+
+# ---- 2. Domain tanimlari ----
+domains <- list(
+  D_Demographic    = c("Age", "Gender"),
+  A_Anthropometric = c("Height", "Weight", "Body Mass Index (BMI)"),
+  C_Comorbidity    = c("Comorbidity", "Coronary Artery Disease (CAD)", "Hypothyroidism",
+                        "Hyperlipidemia", "Diabetes Mellitus (DM)"),
+  B_Bioimpedance   = c("Total Body Water (TBW)", "Extracellular Water (ECW)", "Intracellular Water (ICW)",
+                        "Extracellular Fluid/Total Body Water (ECF/TBW)", "Total Body Fat Ratio (TBFR) (%)",
+                        "Lean Mass (LM) (%)", "Body Protein Content (Protein) (%)", "Visceral Fat Rating (VFR)",
+                        "Bone Mass (BM)", "Muscle Mass (MM)", "Obesity (%)", "Total Fat Content (TFC)",
+                        "Visceral Fat Area (VFA)", "Visceral Muscle Area (VMA) (Kg)"),
+  L_Liver          = c("Aspartat Aminotransferaz (AST)", "Alanin Aminotransferaz (ALT)",
+                        "Alkaline Phosphatase (ALP)", "Hepatic Fat Accumulation (HFA)"),
+  M_Metabolic      = c("Glucose", "Total Cholesterol (TC)", "Low Density Lipoprotein (LDL)",
+                        "High Density Lipoprotein (HDL)", "Triglyceride"),
+  R_Renal          = c("Creatinine", "Glomerular Filtration Rate (GFR)"),
+  I_Inflammation   = c("C-Reactive Protein (CRP)"),
+  H_Hematologic    = c("Hemoglobin (HGB)"),
+  V_Vitamin        = c("Vitamin D")
+)
+
+# Figurlerde gosterilecek TEMIZ isimler (internal kod isimlerinden ayri).
+# Internal isimler (D_Demographic vs.) domains listesinin key'leri olarak
+# kaliyor - kodun geri kalani bunlara referans veriyor, degistirmedim.
+domain_labels <- c(
+  D_Demographic    = "Demographic",
+  A_Anthropometric = "Anthropometric",
+  C_Comorbidity    = "Comorbidity",
+  B_Bioimpedance   = "Bioimpedance",
+  L_Liver          = "Liver",
+  M_Metabolic      = "Metabolic",
+  R_Renal          = "Renal",
+  I_Inflammation   = "Inflammation",
+  H_Hematologic    = "Hematologic",
+  V_Vitamin        = "Vitamin D"
+)
+
+all_feats <- unlist(domains, use.names = FALSE)
+stopifnot(all(all_feats %in% names(df)))
+stopifnot(setequal(all_feats, setdiff(names(df), target)))
+
+X <- as.matrix(df[, all_feats])
+storage.mode(X) <- "double"
+n <- nrow(X)
+
+# ---- 3. Temel kontroller ----
+cat("n =", n, "\n")
+cat("Outcome dagilimi:\n"); print(table(y))
+cat("Eksik deger sayisi:", sum(is.na(df)), "\n")
+cat("Duplicate satir sayisi:", sum(duplicated(df)), "\n")
+
+# ---- 4. Korelasyon / redundancy tablosu ----
+cor_mat <- cor(X, method = "spearman")
+high_idx <- which(abs(cor_mat) > 0.8 & upper.tri(cor_mat), arr.ind = TRUE)
+high_pairs_df <- data.frame(
+  var1 = rownames(cor_mat)[high_idx[, 1]],
+  var2 = colnames(cor_mat)[high_idx[, 2]],
+  r    = cor_mat[high_idx]
+)
+high_pairs_df <- high_pairs_df[order(-abs(high_pairs_df$r)), ]
+write.csv(high_pairs_df, "high_correlation_pairs.csv", row.names = FALSE)
+
+# ---- 5. VIF ----
+vif_manual <- function(Xs) {
+  p <- ncol(Xs)
+  vifs <- numeric(p)
+  for (j in seq_len(p)) {
+    fit <- lm(Xs[, j] ~ Xs[, -j])
+    vifs[j] <- 1 / (1 - summary(fit)$r.squared)
+  }
+  names(vifs) <- colnames(Xs)
+  sort(vifs, decreasing = TRUE)
+}
+vif_vals <- vif_manual(scale(X))
+write.csv(data.frame(variable = names(vif_vals), VIF = vif_vals), "vif_table.csv", row.names = FALSE)
+cat("\nEn yuksek VIF degerleri:\n"); print(head(vif_vals, 10))
+
+# ---- 6. Domain-ici effective dimensionality ----
+effective_dim <- function(cols) {
+  if (length(cols) == 1) return(1L)
+  pc <- prcomp(scale(X[, cols]))
+  cum_var <- cumsum(pc$sdev^2) / sum(pc$sdev^2)
+  which(cum_var >= 0.95)[1]
+}
+eff_dims <- sapply(domains, effective_dim)
+n_vars   <- sapply(domains, length)
+domain_summary <- data.frame(domain = names(domains), n_vars = n_vars, effective_dim = eff_dims)
+write.csv(domain_summary, "domain_dimensionality.csv", row.names = FALSE)
+print(domain_summary)
+
+# ---- 7. Log-loss ve yardimci fonksiyonlar ----
+logloss <- function(y_true, p) {
+  p <- pmin(pmax(p, 1e-6), 1 - 1e-6)
+  -mean(y_true * log(p) + (1 - y_true) * log(1 - p))
+}
+
+domain_reduced_cols <- lapply(domains, function(cols) setdiff(all_feats, cols))
+
+Xs_full <- scale(X)
+cv_full <- cv.glmnet(Xs_full, y, family = "binomial", alpha = 0, nfolds = 5)  # saf ridge
+lambda_fixed <- cv_full$lambda.min
+cat("\nSabitlenen lambda (ridge):", lambda_fixed, "\n")
+
+fit_predict_logloss_glmnet <- function(cols, tr_idx, te_idx) {
+  Xtr <- X[tr_idx, cols, drop = FALSE]
+  ctr <- colMeans(Xtr); scl <- apply(Xtr, 2, sd); scl[scl == 0] <- 1
+  Xtr_s <- scale(Xtr, center = ctr, scale = scl)
+  Xte_s <- scale(X[te_idx, cols, drop = FALSE], center = ctr, scale = scl)
+  fit <- glmnet(Xtr_s, y[tr_idx], family = "binomial", alpha = 0, lambda = lambda_fixed)
+  p <- as.numeric(predict(fit, newx = Xte_s, type = "response"))
+  logloss(y[te_idx], p)
+}
+
+# ---- 8. Repeated stratified 5-fold CV (nokta tahmini) ----
+create_stratified_folds <- function(y, k) {
+  idx0 <- which(y == 0); idx1 <- which(y == 1)
+  f0 <- split(sample(idx0), rep(1:k, length.out = length(idx0)))
+  f1 <- split(sample(idx1), rep(1:k, length.out = length(idx1)))
+  lapply(1:k, function(i) c(f0[[i]], f1[[i]]))
+}
+
+n_repeats <- 20; n_folds <- 5
+test_splits <- list()
+set.seed(42)
+for (r in seq_len(n_repeats)) test_splits <- c(test_splits, create_stratified_folds(y, n_folds))
+cat("Toplam test-fold sayisi:", length(test_splits), "\n")
+
+cv_logloss_glmnet <- function(cols) {
+  sapply(test_splits, function(te_idx) {
+    tr_idx <- setdiff(seq_len(n), te_idx)
+    fit_predict_logloss_glmnet(cols, tr_idx, te_idx)
+  })
+}
+
+full_losses <- cv_logloss_glmnet(all_feats)
+cat("\nFull model ortalama log-loss (repeated CV):", round(mean(full_losses), 4), "\n")
+
+Uj_cv <- list()
+for (d in names(domains)) {
+  red_losses <- cv_logloss_glmnet(domain_reduced_cols[[d]])
+  Uj_cv[[d]] <- red_losses - full_losses
+  cat(sprintf("%-18s Uj(mean)=%.4f  Uj(sd)=%.4f\n", d, mean(Uj_cv[[d]]), sd(Uj_cv[[d]])))
+}
+
+# ---- 9. Hasta-duzeyi bootstrap (Ridge) ----
+B <- 500
+boot_uj_ridge <- setNames(lapply(domains, function(x) numeric(B)), names(domains))
+
+set.seed(123)
+t0 <- Sys.time()
+for (b in seq_len(B)) {
+  boot_idx <- sample(seq_len(n), n, replace = TRUE)
+  oob_idx  <- setdiff(seq_len(n), unique(boot_idx))
+  if (length(oob_idx) < 15) next
+
+  full_ll <- fit_predict_logloss_glmnet(all_feats, boot_idx, oob_idx)
+  for (d in names(domains)) {
+    red_ll <- fit_predict_logloss_glmnet(domain_reduced_cols[[d]], boot_idx, oob_idx)
+    boot_uj_ridge[[d]][b] <- red_ll - full_ll
+  }
+  if (b %% 100 == 0) cat(b, "/", B, "-", round(difftime(Sys.time(), t0, units = "secs"), 1), "sn\n")
+}
+
+ridge_boot_summary <- do.call(rbind, lapply(names(domains), function(d) {
+  v <- boot_uj_ridge[[d]]
+  data.frame(domain = d, mean = mean(v), lo95 = quantile(v, .025), hi95 = quantile(v, .975),
+             p_positive = mean(v > 0))
+}))
+write.csv(ridge_boot_summary, "ridge_bootstrap_Uj.csv", row.names = FALSE)
+cat("\n--- Ridge bootstrap sonuclari ---\n"); print(ridge_boot_summary)
+
+# ---- 10. XGBoost sensitivity analizi ----
+fit_predict_logloss_xgb <- function(cols, tr_idx, te_idx) {
+  dtr <- xgb.DMatrix(data = X[tr_idx, cols, drop = FALSE], label = y[tr_idx])
+  dte <- xgb.DMatrix(data = X[te_idx, cols, drop = FALSE], label = y[te_idx])
+  fit <- xgb.train(
+    params = list(objective = "binary:logistic", max_depth = 2, eta = 0.08,
+                   subsample = 0.8, colsample_bytree = 0.8, lambda = 2, eval_metric = "logloss"),
+    data = dtr, nrounds = 150, verbose = 0
+  )
+  logloss(y[te_idx], predict(fit, dte))
+}
+
+B_xgb <- 200
+boot_uj_xgb <- setNames(lapply(domains, function(x) numeric(B_xgb)), names(domains))
+
+set.seed(7)
+t0 <- Sys.time()
+for (b in seq_len(B_xgb)) {
+  boot_idx <- sample(seq_len(n), n, replace = TRUE)
+  oob_idx  <- setdiff(seq_len(n), unique(boot_idx))
+  if (length(oob_idx) < 15) next
+
+  full_ll <- fit_predict_logloss_xgb(all_feats, boot_idx, oob_idx)
+  for (d in names(domains)) {
+    red_ll <- fit_predict_logloss_xgb(domain_reduced_cols[[d]], boot_idx, oob_idx)
+    boot_uj_xgb[[d]][b] <- red_ll - full_ll
+  }
+  if (b %% 50 == 0) cat(b, "/", B_xgb, "-", round(difftime(Sys.time(), t0, units = "secs"), 1), "sn\n")
+}
+
+xgb_boot_summary <- do.call(rbind, lapply(names(domains), function(d) {
+  v <- boot_uj_xgb[[d]]
+  data.frame(domain = d, mean = mean(v), lo95 = quantile(v, .025), hi95 = quantile(v, .975),
+             p_positive = mean(v > 0))
+}))
+write.csv(xgb_boot_summary, "xgb_bootstrap_Uj.csv", row.names = FALSE)
+cat("\n--- XGBoost bootstrap sonuclari ---\n"); print(xgb_boot_summary)
+
+# ---- 11. Marginal importance ----
+fit_full <- glmnet(Xs_full, y, family = "binomial", alpha = 0, lambda = lambda_fixed)
+coefs <- as.numeric(coef(fit_full))[-1]
+names(coefs) <- all_feats
+domain_importance <- sapply(domains, function(cols) sum(abs(coefs[cols])))
+
+importance_vs_uj <- data.frame(
+  domain      = names(domains),
+  importance  = domain_importance,
+  ridge_Uj    = sapply(names(domains), function(d) mean(boot_uj_ridge[[d]])),
+  xgb_Uj      = sapply(names(domains), function(d) mean(boot_uj_xgb[[d]]))
+)
+write.csv(importance_vs_uj, "importance_vs_Uj.csv", row.names = FALSE)
+cat("\n--- Importance vs Uj ---\n"); print(importance_vs_uj)
+
+# ---- 12. Domain-size confound kontrolu ----
+confound_check <- data.frame(
+  check = c("#vars vs ridge Uj", "#vars vs xgb Uj", "eff.dim vs ridge Uj", "eff.dim vs xgb Uj"),
+  rho = c(
+    cor(n_vars, importance_vs_uj$ridge_Uj, method = "spearman"),
+    cor(n_vars, importance_vs_uj$xgb_Uj,   method = "spearman"),
+    cor(eff_dims, importance_vs_uj$ridge_Uj, method = "spearman"),
+    cor(eff_dims, importance_vs_uj$xgb_Uj,   method = "spearman")
+  )
+)
+write.csv(confound_check, "domain_size_confound_check.csv", row.names = FALSE)
+cat("\n--- Domain-size confound kontrolu ---\n"); print(confound_check)
+
+# ============================================================
+# ---- 13. FIGURLER (ingilizce, basliksiz, temiz domain isimleri,
+#            eksen+legend var, 1600 dpi, png+pdf) ----
+# ============================================================
+
+theme_paper <- theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_blank(),
+    plot.subtitle = element_blank(),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11),
+    axis.title = element_text(size = 13),
+    axis.text = element_text(size = 11)
+  )
+
+save_fig <- function(plot, name, width, height) {
+  ggsave(file.path(fig_dir, paste0(name, ".png")), plot, width = width, height = height,
+         dpi = 1600, units = "in", bg = "white")
+  ggsave(file.path(fig_dir, paste0(name, ".pdf")), plot, width = width, height = height,
+         units = "in", device = cairo_pdf)
+}
+
+## ---- Figure 1: VIF (redundancy motivation) — degisiklik yok, zaten temiz isimler ----
+vif_df <- data.frame(variable = names(vif_vals), VIF = as.numeric(vif_vals))
+vif_df$variable <- factor(vif_df$variable, levels = rev(vif_df$variable))
+
+fig1 <- ggplot(vif_df, aes(x = variable, y = VIF)) +
+  geom_col(fill = "grey30", width = 0.7) +
+  geom_hline(yintercept = 10, linetype = "dashed", color = "firebrick") +
+  coord_flip() +
+  scale_y_log10() +
+  labs(x = "Variable", y = expression("Variance Inflation Factor (" * log[10] * " scale)")) +
+  theme_paper +
+  theme(axis.text.y = element_text(size = 7))
+
+save_fig(fig1, "Fig1_VIF_redundancy", width = 7, height = 9)
+
+## ---- Figure 2: Domain dimensionality — onekler kaldirildi ----
+domain_summary_clean <- domain_summary
+domain_summary_clean$domain <- domain_labels[domain_summary_clean$domain]  # temiz isim
+
+dim_long <- pivot_longer(domain_summary_clean, cols = c(n_vars, effective_dim),
+                          names_to = "type", values_to = "count")
+dim_long$type <- factor(dim_long$type, levels = c("n_vars", "effective_dim"),
+                         labels = c("Nominal variable count", "Effective dimensionality (95% variance)"))
+
+fig2 <- ggplot(dim_long, aes(x = domain, y = count, fill = type)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  scale_fill_manual(values = c("grey70", "grey25"), name = NULL) +
+  labs(x = "Clinical domain", y = "Number of dimensions") +
+  theme_paper +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1),
+        legend.position = "top")
+
+save_fig(fig2, "Fig2_domain_dimensionality", width = 8, height = 5.5)
+
+## ---- Figure 3: Marginal importance vs Uj — onekler kaldirildi ----
+importance_vs_uj_clean <- importance_vs_uj
+importance_vs_uj_clean$domain <- domain_labels[importance_vs_uj_clean$domain]
+
+fig3 <- ggplot(importance_vs_uj_clean, aes(x = importance, y = ridge_Uj, label = domain)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(size = 3, color = "grey20") +
+  geom_text(vjust = -0.9, size = 3.3, color = "grey20") +
+  labs(x = "Marginal importance (sum of |standardized ridge coefficients|)",
+       y = expression(U[j] * " (unique predictive contribution, "*Delta*"log-loss)")) +
+  theme_paper
+
+save_fig(fig3, "Fig3_importance_vs_Uj", width = 8, height = 6)
+
+## ---- Figure 4: Ridge vs XGBoost Uj forest plot — onekler kaldirildi ----
+ridge_boot_summary$model <- "Ridge (linear)"
+xgb_boot_summary$model   <- "XGBoost (nonlinear)"
+forest_df <- rbind(ridge_boot_summary, xgb_boot_summary)
+forest_df$model <- factor(forest_df$model, levels = c("Ridge (linear)", "XGBoost (nonlinear)"))
+forest_df$domain <- domain_labels[forest_df$domain]  # temiz isim
+
+# domainleri ridge Uj ortalamasina gore sirala (internal isimle hesapla, sonra temiz isme cevir)
+domain_order <- domain_labels[importance_vs_uj$domain[order(importance_vs_uj$ridge_Uj)]]
+forest_df$domain <- factor(forest_df$domain, levels = domain_order)
+
+fig4 <- ggplot(forest_df, aes(x = domain, y = mean, ymin = lo95, ymax = hi95, color = model)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_pointrange(position = position_dodge(width = 0.5), size = 0.6) +
+  scale_color_manual(values = c("grey20", "steelblue4"), name = "Model class") +
+  coord_flip() +
+  labs(x = "Clinical domain", y = expression(U[j] * " (95% bootstrap CI)")) +
+  theme_paper +
+  theme(legend.position = "top")
+
+save_fig(fig4, "Fig4_ridge_vs_xgb_forest", width = 8, height = 6)
+
+cat("\n=== 4 FIGUR KAYDEDILDI (png 1600dpi + pdf):", fig_dir, "===\n")
+
+# ---- 14. Workspace kaydet ----
+save.image(file.path(proj_dir, "gallstone_analysis_workspace.RData"))
+cat("\n=== TUM ANALIZ TAMAMLANDI. Ciktilar burada:", proj_dir, "===\n")
