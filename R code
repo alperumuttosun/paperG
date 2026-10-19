@@ -1,34 +1,44 @@
 # ============================================================
-# GALLSTONE INFORMATION-ARCHITECTURE PAPER — ANA ANALIZ KODU
-# Versiyon: v7 (v6 + Figure 3 duzeltmesi: "Bioimpedance" etiketi
-#           panel kenarindan tasiyordu, x-ekseni sag bosluk
-#           (expansion) eklenerek duzeltildi)
+# GALLSTONE PAPER - R CODE  (r_gallstone_v2)
+# Cumulative script: your v7 code merged with the new analyses
+#   A) Mean |coefficient| per domain and the corresponding rank gap (fast)
+#   B) Importance vs domain-size correlation (confirms rho = 0.61)
+#   C) TUNED XGBoost bootstrap (inner CV tuning; ~30-90 min; resumable)
+# Heavy, already-completed analyses (nested ridge bootstrap, fixed-parameter
+# XGBoost bootstrap) are NOT re-run; their results are read from the existing
+# CSV files (RUN_OLD_HEAVY = FALSE).
 # ============================================================
 
-# ---- 0. Kurulum ----
-rm(list = ls())
-base_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"
-proj_dir <- file.path(base_dir, "gallstonepaper")
-fig_dir  <- file.path(proj_dir, "figures")
-if (!dir.exists(proj_dir)) dir.create(proj_dir)
-if (!dir.exists(fig_dir))  dir.create(fig_dir)
-setwd(proj_dir)
+# ---- 0. Setup ----
+rm(list = ls())                                                      # clear the workspace
+base_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"                    # base folder
+proj_dir <- file.path(base_dir, "gallstonepaper")                    # project folder
+fig_dir  <- file.path(proj_dir, "figures")                           # figures folder
+if (!dir.exists(proj_dir)) dir.create(proj_dir)                      # create project folder if missing
+if (!dir.exists(fig_dir))  dir.create(fig_dir)                       # create figures folder if missing
+setwd(proj_dir)                                                      # work inside the project folder
 
-pkgs <- c("readxl", "glmnet", "xgboost", "ggplot2", "tidyr")
-to_install <- pkgs[!pkgs %in% installed.packages()[, "Package"]]
-if (length(to_install) > 0) install.packages(to_install)
-invisible(lapply(pkgs, library, character.only = TRUE))
+pkgs <- c("readxl", "glmnet", "xgboost", "ggplot2", "tidyr")         # required packages
+to_install <- pkgs[!pkgs %in% installed.packages()[, "Package"]]     # find missing packages
+if (length(to_install) > 0) install.packages(to_install)             # install missing packages
+invisible(lapply(pkgs, library, character.only = TRUE))              # load all packages
 
-set.seed(2026)
+# ---- Switches ----
+RUN_OLD_HEAVY <- FALSE   # FALSE: old heavy results are read from CSV (recommended)
+RUN_XGB_TUNED <- TRUE    # TRUE: run the tuned XGBoost bootstrap (long)
+B_xgb_tuned   <- 200     # number of bootstrap replicates for tuned XGBoost (set 20 for a quick test)
+MAKE_FIGURES  <- TRUE    # TRUE: regenerate Figures 1-4
 
-# ---- 1. Veri yukleme ----
-data_path <- file.path(base_dir, "gallstone.xlsx")
-df <- as.data.frame(readxl::read_excel(data_path))
-target <- "Gallstone Status"
-y <- as.numeric(df[[target]])
+set.seed(2026)                                                       # global seed for reproducibility
 
-# ---- 2. Domain tanimlari ----
-domains <- list(
+# ---- 1. Load data ----
+data_path <- file.path(base_dir, "gallstone.xlsx")                   # path to the data file
+df <- as.data.frame(readxl::read_excel(data_path))                   # read the Excel file
+target <- "Gallstone Status"                                         # outcome column name
+y <- as.numeric(df[[target]])                                        # binary outcome (0/1)
+
+# ---- 2. Domain definitions ----
+domains <- list(                                                     # 10 a priori clinical domains
   D_Demographic    = c("Age", "Gender"),
   A_Anthropometric = c("Height", "Weight", "Body Mass Index (BMI)"),
   C_Comorbidity    = c("Comorbidity", "Coronary Artery Disease (CAD)", "Hypothyroidism",
@@ -48,7 +58,7 @@ domains <- list(
   V_Vitamin        = c("Vitamin D")
 )
 
-domain_labels <- c(
+domain_labels <- c(                                                  # clean labels for tables and figures
   D_Demographic    = "Demographic",
   A_Anthropometric = "Anthropometric",
   C_Comorbidity    = "Comorbidity",
@@ -61,318 +71,368 @@ domain_labels <- c(
   V_Vitamin        = "Vitamin D"
 )
 
-all_feats <- unlist(domains, use.names = FALSE)
-stopifnot(all(all_feats %in% names(df)))
-stopifnot(setequal(all_feats, setdiff(names(df), target)))
+all_feats <- unlist(domains, use.names = FALSE)                      # all 38 feature names
+stopifnot(all(all_feats %in% names(df)))                             # every feature must exist in the data
+stopifnot(setequal(all_feats, setdiff(names(df), target)))           # no extra or missing columns
 
-X <- as.matrix(df[, all_feats])
-storage.mode(X) <- "double"
-n <- nrow(X)
+X <- as.matrix(df[, all_feats])                                      # feature matrix
+storage.mode(X) <- "double"                                          # make it numeric
+n <- nrow(X)                                                         # number of patients
 
-cat("n =", n, "\n")
-cat("Outcome dagilimi:\n"); print(table(y))
-cat("Eksik deger sayisi:", sum(is.na(df)), "\n")
-cat("Duplicate satir sayisi:", sum(duplicated(df)), "\n")
+cat("n =", n, "\n")                                                  # sample size
+cat("Outcome distribution:\n"); print(table(y))                       # class balance
+cat("Missing values:", sum(is.na(df)), "\n")                          # count missing values
+cat("Duplicate rows:", sum(duplicated(df)), "\n")                     # count duplicate rows
 
-# ---- 4. Korelasyon / redundancy ----
-cor_mat <- cor(X, method = "spearman")
-high_idx <- which(abs(cor_mat) > 0.8 & upper.tri(cor_mat), arr.ind = TRUE)
+# ---- 4. Correlation / redundancy (fast) ----
+cor_mat <- cor(X, method = "spearman")                               # Spearman correlation matrix
+high_idx <- which(abs(cor_mat) > 0.8 & upper.tri(cor_mat), arr.ind = TRUE)  # pairs with |rho| > 0.8
 high_pairs_df <- data.frame(
-  var1 = rownames(cor_mat)[high_idx[, 1]],
-  var2 = colnames(cor_mat)[high_idx[, 2]],
-  r    = cor_mat[high_idx]
+  var1 = rownames(cor_mat)[high_idx[, 1]],                           # first variable of the pair
+  var2 = colnames(cor_mat)[high_idx[, 2]],                           # second variable of the pair
+  r    = cor_mat[high_idx]                                           # correlation value
 )
-high_pairs_df <- high_pairs_df[order(-abs(high_pairs_df$r)), ]
-write.csv(high_pairs_df, "high_correlation_pairs.csv", row.names = FALSE)
+high_pairs_df <- high_pairs_df[order(-abs(high_pairs_df$r)), ]       # sort by strength
+write.csv(high_pairs_df, "high_correlation_pairs.csv", row.names = FALSE)  # save
 
-# ---- 5. VIF ----
-vif_manual <- function(Xs) {
-  p <- ncol(Xs)
-  vifs <- numeric(p)
-  for (j in seq_len(p)) {
-    fit <- lm(Xs[, j] ~ Xs[, -j])
-    vifs[j] <- 1 / (1 - summary(fit)$r.squared)
+# ---- 5. VIF (fast) ----
+vif_manual <- function(Xs) {                                         # compute VIF for each variable
+  p <- ncol(Xs)                                                      # number of variables
+  vifs <- numeric(p)                                                 # storage for VIFs
+  for (j in seq_len(p)) {                                            # loop over variables
+    fit <- lm(Xs[, j] ~ Xs[, -j])                                    # regress variable j on all others
+    vifs[j] <- 1 / (1 - summary(fit)$r.squared)                      # VIF = 1 / (1 - R^2)
   }
-  names(vifs) <- colnames(Xs)
-  sort(vifs, decreasing = TRUE)
+  names(vifs) <- colnames(Xs)                                        # name the VIFs
+  sort(vifs, decreasing = TRUE)                                      # largest first
 }
-vif_vals <- vif_manual(scale(X))
-write.csv(data.frame(variable = names(vif_vals), VIF = vif_vals), "vif_table.csv", row.names = FALSE)
-cat("\nEn yuksek VIF degerleri:\n"); print(head(vif_vals, 10))
+vif_vals <- vif_manual(scale(X))                                     # VIF on standardized features
+write.csv(data.frame(variable = names(vif_vals), VIF = vif_vals), "vif_table.csv", row.names = FALSE)  # save
+cat("\nTop VIF values:\n"); print(head(vif_vals, 10))                # show the 10 largest
 
-# ---- 6. Domain-ici effective dimensionality (PCA-based) ----
-effective_dim <- function(cols) {
-  if (length(cols) == 1) return(1L)
-  pc <- prcomp(scale(X[, cols]))
-  cum_var <- cumsum(pc$sdev^2) / sum(pc$sdev^2)
-  which(cum_var >= 0.95)[1]
+# ---- 6. Within-domain effective dimensionality (fast) ----
+effective_dim <- function(cols) {                                    # PCs needed for 95% of variance
+  if (length(cols) == 1) return(1L)                                  # single variable -> 1 dimension
+  pc <- prcomp(scale(X[, cols]))                                     # PCA on the domain variables
+  cum_var <- cumsum(pc$sdev^2) / sum(pc$sdev^2)                      # cumulative variance explained
+  which(cum_var >= 0.95)[1]                                          # first PC count reaching 95%
 }
-eff_dims <- sapply(domains, effective_dim)
-n_vars   <- sapply(domains, length)
+eff_dims <- sapply(domains, effective_dim)                           # effective dimension per domain
+n_vars   <- sapply(domains, length)                                  # nominal variable count per domain
 domain_summary <- data.frame(domain = names(domains), n_vars = n_vars, effective_dim = eff_dims)
-write.csv(domain_summary, "domain_dimensionality.csv", row.names = FALSE)
-print(domain_summary)
+write.csv(domain_summary, "domain_dimensionality.csv", row.names = FALSE)  # save
+print(domain_summary)                                                # show the table
 
-# ---- 7. Log-loss ve NESTED-TUNING yardimci fonksiyon ----
-logloss <- function(y_true, p) {
-  p <- pmin(pmax(p, 1e-6), 1 - 1e-6)
-  -mean(y_true * log(p) + (1 - y_true) * log(1 - p))
+# ---- 7. Log-loss and helper objects ----
+logloss <- function(y_true, p) {                                     # binary log-loss
+  p <- pmin(pmax(p, 1e-6), 1 - 1e-6)                                 # clip probabilities away from 0 and 1
+  -mean(y_true * log(p) + (1 - y_true) * log(1 - p))                 # mean negative log-likelihood
 }
 
-domain_reduced_cols <- lapply(domains, function(cols) setdiff(all_feats, cols))
+domain_reduced_cols <- lapply(domains, function(cols) setdiff(all_feats, cols))  # features with one domain removed
 
-# lambda artik SABITLENMIYOR. Her cagride, verilen egitim setinin
-# (tr_idx) KENDI ICINDE 5-fold ic-CV ile lambda secilir (cv.glmnet),
-# sonra o egitim setiyle fit edilip test setinde degerlendirilir.
-# Boylece test seti (te_idx) lambda secimine hicbir sekilde karismaz.
-fit_predict_logloss_glmnet_nested <- function(cols, tr_idx, te_idx, inner_folds = 5) {
-  Xtr <- X[tr_idx, cols, drop = FALSE]
-  ytr <- y[tr_idx]
-  ctr <- colMeans(Xtr); scl <- apply(Xtr, 2, sd); scl[scl == 0] <- 1
-  Xtr_s <- scale(Xtr, center = ctr, scale = scl)
-  Xte_s <- scale(X[te_idx, cols, drop = FALSE], center = ctr, scale = scl)
-
-  cvfit <- cv.glmnet(Xtr_s, ytr, family = "binomial", alpha = 0, nfolds = inner_folds)
-  fit <- glmnet(Xtr_s, ytr, family = "binomial", alpha = 0, lambda = cvfit$lambda.min)
-
-  p <- as.numeric(predict(fit, newx = Xte_s, type = "response"))
-  logloss(y[te_idx], p)
-}
-
-# ---- 8. Repeated stratified 5-fold CV (nested tuning ile nokta tahmini) ----
-create_stratified_folds <- function(y, k) {
-  idx0 <- which(y == 0); idx1 <- which(y == 1)
-  f0 <- split(sample(idx0), rep(1:k, length.out = length(idx0)))
-  f1 <- split(sample(idx1), rep(1:k, length.out = length(idx1)))
-  lapply(1:k, function(i) c(f0[[i]], f1[[i]]))
-}
-
-n_repeats <- 20; n_folds <- 5
-test_splits <- list()
-set.seed(42)
-for (r in seq_len(n_repeats)) test_splits <- c(test_splits, create_stratified_folds(y, n_folds))
-cat("Toplam test-fold sayisi:", length(test_splits), "\n")
-
-cv_logloss_glmnet_nested <- function(cols) {
-  sapply(test_splits, function(te_idx) {
-    tr_idx <- setdiff(seq_len(n), te_idx)
-    fit_predict_logloss_glmnet_nested(cols, tr_idx, te_idx)
-  })
-}
-
-t0 <- Sys.time()
-full_losses <- cv_logloss_glmnet_nested(all_feats)
-cat(sprintf("Full model ortalama log-loss (repeated CV, nested tuning): %.4f  (sure: %.1f sn)\n",
-            mean(full_losses), as.numeric(difftime(Sys.time(), t0, units = "secs"))))
-
-Uj_cv <- list()
-t0 <- Sys.time()
-for (d in names(domains)) {
-  red_losses <- cv_logloss_glmnet_nested(domain_reduced_cols[[d]])
-  Uj_cv[[d]] <- red_losses - full_losses
-  cat(sprintf("%-18s Uj(mean)=%.4f  Uj(sd)=%.4f\n", d, mean(Uj_cv[[d]]), sd(Uj_cv[[d]])))
-}
-cat(sprintf("Repeated-CV toplam sure (10 domain): %.1f sn\n", as.numeric(difftime(Sys.time(), t0, units = "secs"))))
-
-# ---- 9. Hasta-duzeyi bootstrap (Ridge, NESTED tuning) ----
-B <- 500
-boot_uj_ridge <- setNames(lapply(domains, function(x) numeric(B)), names(domains))
-
-set.seed(123)
-t0 <- Sys.time()
-for (b in seq_len(B)) {
-  boot_idx <- sample(seq_len(n), n, replace = TRUE)
-  oob_idx  <- setdiff(seq_len(n), unique(boot_idx))
-  if (length(oob_idx) < 15) next
-
-  full_ll <- fit_predict_logloss_glmnet_nested(all_feats, boot_idx, oob_idx)
-  for (d in names(domains)) {
-    red_ll <- fit_predict_logloss_glmnet_nested(domain_reduced_cols[[d]], boot_idx, oob_idx)
-    boot_uj_ridge[[d]][b] <- red_ll - full_ll
+# ================== 8-11. OLD HEAVY ANALYSES ==================
+if (RUN_OLD_HEAVY) {
+  # ---- 7b. Nested ridge ----
+  fit_predict_logloss_glmnet_nested <- function(cols, tr_idx, te_idx, inner_folds = 5) {
+    Xtr <- X[tr_idx, cols, drop = FALSE]                             # training features
+    ytr <- y[tr_idx]                                                 # training outcome
+    ctr <- colMeans(Xtr); scl <- apply(Xtr, 2, sd); scl[scl == 0] <- 1  # training means and SDs
+    Xtr_s <- scale(Xtr, center = ctr, scale = scl)                   # standardize training data
+    Xte_s <- scale(X[te_idx, cols, drop = FALSE], center = ctr, scale = scl)  # standardize test data with training stats
+    cvfit <- cv.glmnet(Xtr_s, ytr, family = "binomial", alpha = 0, nfolds = inner_folds)  # inner CV picks lambda
+    fit <- glmnet(Xtr_s, ytr, family = "binomial", alpha = 0, lambda = cvfit$lambda.min)  # final ridge fit
+    p <- as.numeric(predict(fit, newx = Xte_s, type = "response"))   # predicted probabilities
+    logloss(y[te_idx], p)                                            # test log-loss
   }
-  if (b %% 50 == 0) cat(b, "/", B, "-", round(difftime(Sys.time(), t0, units = "secs"), 1), "sn\n")
-}
-cat("Ridge bootstrap toplam suresi:", round(difftime(Sys.time(), t0, units = "secs"), 1), "sn\n")
 
-ridge_boot_summary <- do.call(rbind, lapply(names(domains), function(d) {
-  v <- boot_uj_ridge[[d]]
-  data.frame(domain = d, mean = mean(v), lo95 = quantile(v, .025), hi95 = quantile(v, .975),
-             p_positive = mean(v > 0))
-}))
-write.csv(ridge_boot_summary, "ridge_bootstrap_Uj.csv", row.names = FALSE)
-cat("\n--- Ridge bootstrap sonuclari (nested tuning) ---\n"); print(ridge_boot_summary)
-
-# ---- 10. XGBoost sensitivity ----
-xgb_params <- list(objective = "binary:logistic", max_depth = 2, eta = 0.08,
-                    subsample = 0.8, colsample_bytree = 0.8, lambda = 2,
-                    eval_metric = "logloss")
-xgb_nrounds <- 150
-
-fit_predict_logloss_xgb <- function(cols, tr_idx, te_idx) {
-  dtr <- xgb.DMatrix(data = X[tr_idx, cols, drop = FALSE], label = y[tr_idx])
-  dte <- xgb.DMatrix(data = X[te_idx, cols, drop = FALSE], label = y[te_idx])
-  fit <- xgb.train(params = xgb_params, data = dtr, nrounds = xgb_nrounds, verbose = 0)
-  logloss(y[te_idx], predict(fit, dte))
-}
-
-B_xgb <- 200
-boot_uj_xgb <- setNames(lapply(domains, function(x) numeric(B_xgb)), names(domains))
-
-set.seed(7)
-t0 <- Sys.time()
-for (b in seq_len(B_xgb)) {
-  boot_idx <- sample(seq_len(n), n, replace = TRUE)
-  oob_idx  <- setdiff(seq_len(n), unique(boot_idx))
-  if (length(oob_idx) < 15) next
-
-  full_ll <- fit_predict_logloss_xgb(all_feats, boot_idx, oob_idx)
-  for (d in names(domains)) {
-    red_ll <- fit_predict_logloss_xgb(domain_reduced_cols[[d]], boot_idx, oob_idx)
-    boot_uj_xgb[[d]][b] <- red_ll - full_ll
+  # ---- 8. Repeated stratified 5-fold CV ----
+  create_stratified_folds <- function(y, k) {                        # stratified k-fold test indices
+    idx0 <- which(y == 0); idx1 <- which(y == 1)                     # indices of each class
+    f0 <- split(sample(idx0), rep(1:k, length.out = length(idx0)))   # shuffle and split class 0
+    f1 <- split(sample(idx1), rep(1:k, length.out = length(idx1)))   # shuffle and split class 1
+    lapply(1:k, function(i) c(f0[[i]], f1[[i]]))                     # combine per fold
   }
+  n_repeats <- 20; n_folds <- 5                                      # 20 repeats x 5 folds
+  test_splits <- list()                                              # storage for all test folds
+  set.seed(42)                                                       # seed for the CV splits
+  for (r in seq_len(n_repeats)) test_splits <- c(test_splits, create_stratified_folds(y, n_folds))  # build all splits
+  cv_logloss_glmnet_nested <- function(cols) {                       # CV log-loss over all splits
+    sapply(test_splits, function(te_idx) {
+      tr_idx <- setdiff(seq_len(n), te_idx)                          # training indices
+      fit_predict_logloss_glmnet_nested(cols, tr_idx, te_idx)        # test log-loss for this split
+    })
+  }
+  full_losses <- cv_logloss_glmnet_nested(all_feats)                 # full-model losses
+  Uj_cv <- list()                                                    # storage for domain contributions
+  for (d in names(domains)) {                                        # loop over domains
+    Uj_cv[[d]] <- cv_logloss_glmnet_nested(domain_reduced_cols[[d]]) - full_losses  # U_j = reduced - full
+    cat(sprintf("%-18s Uj(mean)=%.4f\n", d, mean(Uj_cv[[d]])))       # print the mean
+  }
+
+  # ---- 9. Ridge bootstrap (B = 500) ----
+  B <- 500                                                           # number of bootstrap replicates
+  boot_uj_ridge <- setNames(lapply(domains, function(x) numeric(B)), names(domains))  # storage
+  set.seed(123)                                                      # bootstrap seed
+  for (b in seq_len(B)) {
+    boot_idx <- sample(seq_len(n), n, replace = TRUE)                # bootstrap training sample
+    oob_idx  <- setdiff(seq_len(n), unique(boot_idx))                # out-of-bag test patients
+    if (length(oob_idx) < 15) next                                   # skip if OOB set is too small
+    full_ll <- fit_predict_logloss_glmnet_nested(all_feats, boot_idx, oob_idx)  # full-model OOB loss
+    for (d in names(domains)) {
+      boot_uj_ridge[[d]][b] <- fit_predict_logloss_glmnet_nested(domain_reduced_cols[[d]], boot_idx, oob_idx) - full_ll  # U_j
+    }
+  }
+  ridge_boot_summary <- do.call(rbind, lapply(names(domains), function(d) {
+    v <- boot_uj_ridge[[d]]                                          # bootstrap U_j values
+    data.frame(domain = d, mean = mean(v), lo95 = quantile(v, .025), hi95 = quantile(v, .975), p_positive = mean(v > 0))
+  }))
+  write.csv(ridge_boot_summary, "ridge_bootstrap_Uj.csv", row.names = FALSE)  # save
+
+  # ---- 10. XGBoost (fixed hyperparameters, B = 200) ----
+  xgb_params <- list(objective = "binary:logistic", max_depth = 2, eta = 0.08,
+                     subsample = 0.8, colsample_bytree = 0.8, lambda = 2, eval_metric = "logloss")  # fixed settings
+  xgb_nrounds <- 150                                                 # number of boosting rounds
+  fit_predict_logloss_xgb <- function(cols, tr_idx, te_idx) {
+    dtr <- xgb.DMatrix(data = X[tr_idx, cols, drop = FALSE], label = y[tr_idx])  # training matrix
+    dte <- xgb.DMatrix(data = X[te_idx, cols, drop = FALSE], label = y[te_idx])  # test matrix
+    fit <- xgb.train(params = xgb_params, data = dtr, nrounds = xgb_nrounds, verbose = 0)  # fit XGBoost
+    logloss(y[te_idx], predict(fit, dte))                            # test log-loss
+  }
+  B_xgb <- 200                                                       # number of bootstrap replicates
+  boot_uj_xgb <- setNames(lapply(domains, function(x) numeric(B_xgb)), names(domains))  # storage
+  set.seed(7)                                                        # bootstrap seed
+  for (b in seq_len(B_xgb)) {
+    boot_idx <- sample(seq_len(n), n, replace = TRUE)                # bootstrap training sample
+    oob_idx  <- setdiff(seq_len(n), unique(boot_idx))                # out-of-bag test patients
+    if (length(oob_idx) < 15) next                                   # skip if OOB set is too small
+    full_ll <- fit_predict_logloss_xgb(all_feats, boot_idx, oob_idx) # full-model OOB loss
+    for (d in names(domains)) {
+      boot_uj_xgb[[d]][b] <- fit_predict_logloss_xgb(domain_reduced_cols[[d]], boot_idx, oob_idx) - full_ll  # U_j
+    }
+  }
+  xgb_boot_summary <- do.call(rbind, lapply(names(domains), function(d) {
+    v <- boot_uj_xgb[[d]]                                            # bootstrap U_j values
+    data.frame(domain = d, mean = mean(v), lo95 = quantile(v, .025), hi95 = quantile(v, .975), p_positive = mean(v > 0))
+  }))
+  write.csv(xgb_boot_summary, "xgb_bootstrap_Uj.csv", row.names = FALSE)  # save
+
+  # ---- 11. Coefficient-based importance ----
+  Xs_full <- scale(X)                                                # standardize all features
+  cv_full <- cv.glmnet(Xs_full, y, family = "binomial", alpha = 0, nfolds = 5)  # choose ridge lambda
+  fit_full <- glmnet(Xs_full, y, family = "binomial", alpha = 0, lambda = cv_full$lambda.min)  # full ridge fit
+  coefs <- as.numeric(coef(fit_full))[-1]; names(coefs) <- all_feats # coefficients without intercept
+  domain_importance <- sapply(domains, function(cols) sum(abs(coefs[cols])))  # sum of |coef| per domain
+  importance_vs_uj <- data.frame(
+    domain = names(domains), importance = domain_importance,
+    ridge_Uj = sapply(names(domains), function(d) mean(boot_uj_ridge[[d]])),
+    xgb_Uj   = sapply(names(domains), function(d) mean(boot_uj_xgb[[d]])))
+  write.csv(importance_vs_uj, "importance_vs_Uj.csv", row.names = FALSE)  # save
+} else {
+  # Heavy analyses skipped: previous results are read from CSV
+  cat("\n[RUN_OLD_HEAVY = FALSE] Reading previous results from CSV...\n")
+  ridge_boot_summary <- read.csv("ridge_bootstrap_Uj.csv", check.names = FALSE)  # ridge bootstrap summary
+  xgb_boot_summary   <- read.csv("xgb_bootstrap_Uj.csv",   check.names = FALSE)  # XGBoost bootstrap summary
+  importance_vs_uj   <- read.csv("importance_vs_Uj.csv",   check.names = FALSE)  # importance vs U_j table
+  importance_vs_uj <- importance_vs_uj[match(names(domains), importance_vs_uj$domain), ]  # align domain order
+  stopifnot(!anyNA(importance_vs_uj$domain))                         # all domains must be found
 }
-cat("XGBoost bootstrap toplam suresi:", round(difftime(Sys.time(), t0, units = "secs"), 1), "sn\n")
+cat("\n--- Importance vs Uj ---\n"); print(importance_vs_uj)         # show the table
 
-xgb_boot_summary <- do.call(rbind, lapply(names(domains), function(d) {
-  v <- boot_uj_xgb[[d]]
-  data.frame(domain = d, mean = mean(v), lo95 = quantile(v, .025), hi95 = quantile(v, .975),
-             p_positive = mean(v > 0))
-}))
-write.csv(xgb_boot_summary, "xgb_bootstrap_Uj.csv", row.names = FALSE)
-cat("\n--- XGBoost bootstrap sonuclari ---\n"); print(xgb_boot_summary)
-
-# ---- 11. Coefficient-based domain importance ----
-Xs_full <- scale(X)
-cv_full <- cv.glmnet(Xs_full, y, family = "binomial", alpha = 0, nfolds = 5)
-fit_full <- glmnet(Xs_full, y, family = "binomial", alpha = 0, lambda = cv_full$lambda.min)
-coefs <- as.numeric(coef(fit_full))[-1]
-names(coefs) <- all_feats
-domain_importance <- sapply(domains, function(cols) sum(abs(coefs[cols])))
-
-importance_vs_uj <- data.frame(
-  domain      = names(domains),
-  importance  = domain_importance,
-  ridge_Uj    = sapply(names(domains), function(d) mean(boot_uj_ridge[[d]])),
-  xgb_Uj      = sapply(names(domains), function(d) mean(boot_uj_xgb[[d]]))
-)
-write.csv(importance_vs_uj, "importance_vs_Uj.csv", row.names = FALSE)
-cat("\n--- Importance vs Uj ---\n"); print(importance_vs_uj)
-
-# ---- 11.5 Importance rank / Uj rank / Rank gap tablosu ----
-importance_vs_uj$imp_rank <- rank(-importance_vs_uj$importance, ties.method = "min")
-importance_vs_uj$uj_rank  <- rank(-importance_vs_uj$ridge_Uj,   ties.method = "min")
-importance_vs_uj$rank_gap <- importance_vs_uj$uj_rank - importance_vs_uj$imp_rank
-
+# ---- 11.5 Importance rank / Uj rank / rank gap ----
+importance_vs_uj$imp_rank <- rank(-importance_vs_uj$importance, ties.method = "min")  # importance rank (1 = largest)
+importance_vs_uj$uj_rank  <- rank(-importance_vs_uj$ridge_Uj,   ties.method = "min")  # ridge U_j rank (1 = largest)
+importance_vs_uj$rank_gap <- importance_vs_uj$uj_rank - importance_vs_uj$imp_rank     # gap = U_j rank - importance rank
 rank_gap_table <- importance_vs_uj[order(importance_vs_uj$rank_gap),
-                                    c("domain", "importance", "imp_rank",
-                                      "ridge_Uj", "uj_rank", "rank_gap")]
-write.csv(rank_gap_table, "rank_gap_table.csv", row.names = FALSE)
-cat("\n--- Importance vs Uj rank gap (kucukten buyuge) ---\n"); print(rank_gap_table)
-cat("Rank gap toplami (0 olmali):", sum(rank_gap_table$rank_gap), "\n")
+                                    c("domain", "importance", "imp_rank", "ridge_Uj", "uj_rank", "rank_gap")]
+write.csv(rank_gap_table, "rank_gap_table.csv", row.names = FALSE)   # save
+cat("\n--- Rank gap (ascending) ---\n"); print(rank_gap_table)       # show the table
+cat("Sum of rank gaps (should be 0):", sum(rank_gap_table$rank_gap), "\n")  # sanity check
 
-# ---- 12. Domain-size confound kontrolu ----
+# ---- 12. Domain-size confound check (+ importance vs size, NEW) ----
 confound_check <- data.frame(
-  check = c("#vars vs ridge Uj", "#vars vs xgb Uj", "eff.dim vs ridge Uj", "eff.dim vs xgb Uj"),
-  rho = c(
-    cor(n_vars, importance_vs_uj$ridge_Uj, method = "spearman"),
-    cor(n_vars, importance_vs_uj$xgb_Uj,   method = "spearman"),
-    cor(eff_dims, importance_vs_uj$ridge_Uj, method = "spearman"),
-    cor(eff_dims, importance_vs_uj$xgb_Uj,   method = "spearman")
+  check = c("#vars vs ridge Uj", "#vars vs xgb Uj", "eff.dim vs ridge Uj", "eff.dim vs xgb Uj",
+            "#vars vs importance (sum)", "eff.dim vs importance (sum)"),   # what is correlated
+  rho = c(                                                           # Spearman correlations
+    cor(n_vars,   importance_vs_uj$ridge_Uj,   method = "spearman"),
+    cor(n_vars,   importance_vs_uj$xgb_Uj,     method = "spearman"),
+    cor(eff_dims, importance_vs_uj$ridge_Uj,   method = "spearman"),
+    cor(eff_dims, importance_vs_uj$xgb_Uj,     method = "spearman"),
+    cor(n_vars,   importance_vs_uj$importance, method = "spearman"),
+    cor(eff_dims, importance_vs_uj$importance, method = "spearman")
+  ),
+  p = c(                                                             # corresponding p-values
+    cor.test(n_vars,   importance_vs_uj$ridge_Uj,   method = "spearman", exact = FALSE)$p.value,
+    cor.test(n_vars,   importance_vs_uj$xgb_Uj,     method = "spearman", exact = FALSE)$p.value,
+    cor.test(eff_dims, importance_vs_uj$ridge_Uj,   method = "spearman", exact = FALSE)$p.value,
+    cor.test(eff_dims, importance_vs_uj$xgb_Uj,     method = "spearman", exact = FALSE)$p.value,
+    cor.test(n_vars,   importance_vs_uj$importance, method = "spearman", exact = FALSE)$p.value,
+    cor.test(eff_dims, importance_vs_uj$importance, method = "spearman", exact = FALSE)$p.value
   )
 )
-write.csv(confound_check, "domain_size_confound_check.csv", row.names = FALSE)
-cat("\n--- Domain-size confound kontrolu ---\n"); print(confound_check)
+write.csv(confound_check, "domain_size_confound_check.csv", row.names = FALSE)  # OUTPUT 1 (send back)
+cat("\n--- Domain-size confound check ---\n"); print(confound_check)  # show the table
 
-# ---- 13. FIGURLER ----
-theme_paper <- theme_classic(base_size = 14) +
-  theme(
-    plot.title = element_blank(),
-    plot.subtitle = element_blank(),
-    legend.title = element_text(size = 12),
-    legend.text = element_text(size = 11),
-    axis.title = element_text(size = 13),
-    axis.text = element_text(size = 11)
-  )
+# ================== NEW A) MEAN |COEFFICIENT| (fast) ==================
+set.seed(2027)                                                       # fixed seed for lambda selection
+Xs_all <- scale(X)                                                   # standardize all features
+cv_all <- cv.glmnet(Xs_all, y, family = "binomial", alpha = 0, nfolds = 5)  # choose ridge lambda by CV
+b_all  <- abs(as.numeric(coef(glmnet(Xs_all, y, family = "binomial", alpha = 0,
+                                      lambda = cv_all$lambda.min)))[-1])  # absolute coefficients
+names(b_all) <- all_feats                                            # name the coefficients
+alt_imp <- data.frame(
+  domain   = names(domains),                                         # domain name
+  n_vars   = n_vars,                                                 # number of variables
+  sum_abs  = sapply(domains, function(v) sum(b_all[v])),             # summed |coef| (recomputed)
+  mean_abs = sapply(domains, function(v) mean(b_all[v])),            # mean |coef| per variable
+  row.names = NULL
+)
+alt_imp <- merge(alt_imp, importance_vs_uj[, c("domain", "ridge_Uj", "uj_rank", "imp_rank")], by = "domain")  # add U_j and ranks
+alt_imp$rank_mean <- rank(-alt_imp$mean_abs, ties.method = "min")    # rank by mean |coef|
+alt_imp$gap_mean  <- alt_imp$uj_rank - alt_imp$rank_mean             # gap = U_j rank - mean-importance rank
+alt_imp <- alt_imp[order(alt_imp$gap_mean), ]                        # sort by gap
+write.csv(alt_imp, "meanabs_rank_gap.csv", row.names = FALSE)        # OUTPUT 2 (send back)
+cat("\n--- Rank gap using mean |coefficient| ---\n"); print(alt_imp)  # show the table
+cat("Spearman(sum_abs, mean_abs):", cor(alt_imp$sum_abs, alt_imp$mean_abs, method = "spearman"), "\n")  # agreement of the two summaries
 
-save_fig <- function(plot, name, width, height) {
-  ggsave(file.path(fig_dir, paste0(name, ".png")), plot, width = width, height = height,
-         dpi = 1600, units = "in", bg = "white")
-  ggsave(file.path(fig_dir, paste0(name, ".pdf")), plot, width = width, height = height,
-         units = "in", device = cairo_pdf)
+# ================== NEW B) TUNED XGBoost BOOTSTRAP (long) ==================
+if (RUN_XGB_TUNED) {
+  xgb_grid <- expand.grid(max_depth = c(1, 2, 3), eta = c(0.05, 0.1))  # 6 hyperparameter combinations
+
+  # Inside the training set: 5-fold CV picks max_depth, eta and number of rounds; returns OOB log-loss
+  xgb_tuned_ll <- function(cols, tr_idx, te_idx) {
+    dtr <- xgb.DMatrix(data = X[tr_idx, cols, drop = FALSE], label = y[tr_idx])  # training matrix
+    best_ll <- Inf; best_prm <- NULL; best_nr <- NA                  # best CV result so far
+    for (g in seq_len(nrow(xgb_grid))) {                             # loop over the grid
+      prm <- list(objective = "binary:logistic", eval_metric = "logloss",
+                  max_depth = xgb_grid$max_depth[g], eta = xgb_grid$eta[g],
+                  subsample = 0.8, colsample_bytree = 0.8, lambda = 2, nthread = 2)  # parameters for this grid point
+      cvr <- xgb.cv(params = prm, data = dtr, nrounds = 300, nfold = 5, verbose = FALSE)  # 5-fold CV
+      el  <- as.data.frame(cvr$evaluation_log)                       # CV log-loss per round
+      it  <- which.min(el$test_logloss_mean)                         # best number of rounds
+      if (el$test_logloss_mean[it] < best_ll) { best_ll <- el$test_logloss_mean[it]; best_prm <- prm; best_nr <- it }  # keep the best
+    }
+    fit <- xgb.train(params = best_prm, data = dtr, nrounds = best_nr, verbose = 0)  # refit with the best setting
+    dte <- xgb.DMatrix(data = X[te_idx, cols, drop = FALSE], label = y[te_idx])      # OOB test matrix
+    logloss(y[te_idx], predict(fit, dte))                            # OOB log-loss
+  }
+
+  part_file <- "xgb_tuned_partial.rds"                               # checkpoint file (resume if interrupted)
+  if (file.exists(part_file)) {                                      # an earlier partial run exists
+    st <- readRDS(part_file); res_tuned <- st$res; b_start <- st$b + 1  # load progress
+    cat("Resuming from:", b_start, "/", B_xgb_tuned, "\n")           # tell the user
+  } else {
+    res_tuned <- matrix(NA_real_, B_xgb_tuned, length(domains), dimnames = list(NULL, names(domains)))  # empty results
+    b_start <- 1                                                     # start from the beginning
+  }
+
+  t0 <- Sys.time()                                                   # start time
+  if (b_start <= B_xgb_tuned) for (bb in b_start:B_xgb_tuned) {      # bootstrap loop
+    set.seed(5000 + bb)                                              # reproducible seed per replicate
+    boot_idx <- sample(seq_len(n), n, replace = TRUE)                # bootstrap training sample
+    oob_idx  <- setdiff(seq_len(n), unique(boot_idx))                # out-of-bag test patients
+    if (length(oob_idx) < 15) next                                   # skip if OOB set is too small
+    ll_full <- xgb_tuned_ll(all_feats, boot_idx, oob_idx)            # full-model tuned OOB loss
+    for (d in names(domains))                                        # remove each domain and refit
+      res_tuned[bb, d] <- xgb_tuned_ll(domain_reduced_cols[[d]], boot_idx, oob_idx) - ll_full  # U_j
+    if (bb %% 10 == 0) {                                             # every 10 replicates
+      saveRDS(list(res = res_tuned, b = bb), part_file)              # save a checkpoint
+      cat("bootstrap", bb, "/", B_xgb_tuned, "-", round(difftime(Sys.time(), t0, units = "mins"), 1), "min\n")  # progress
+    }
+  }
+  write.csv(res_tuned, "xgb_tuned_bootstrap_Uj.csv", row.names = FALSE)  # OUTPUT 3 (raw bootstrap values)
+  xgb_tuned_summary <- do.call(rbind, lapply(names(domains), function(d) {
+    v <- res_tuned[, d]; v <- v[!is.na(v)]                           # valid replicates only
+    data.frame(domain = d, mean = mean(v), lo95 = unname(quantile(v, .025)),
+               hi95 = unname(quantile(v, .975)), p_positive = mean(v > 0), n_boot = length(v))  # summary row
+  }))
+  write.csv(xgb_tuned_summary, "xgb_tuned_summary.csv", row.names = FALSE)  # OUTPUT 4 (summary)
+  cat("\n--- Tuned XGBoost bootstrap summary ---\n"); print(xgb_tuned_summary[order(-xgb_tuned_summary$mean), ])  # show sorted
 }
 
-## Figure 1
-vif_df <- data.frame(variable = names(vif_vals), VIF = as.numeric(vif_vals))
-vif_df$variable <- factor(vif_df$variable, levels = rev(vif_df$variable))
+# ---- 13. FIGURES ----
+if (MAKE_FIGURES) {
+  theme_paper <- theme_classic(base_size = 14) +                     # clean publication theme
+    theme(
+      plot.title = element_blank(),                                  # no title (caption goes in manuscript)
+      plot.subtitle = element_blank(),                               # no subtitle
+      legend.title = element_text(size = 12),                        # legend title size
+      legend.text = element_text(size = 11),                         # legend text size
+      axis.title = element_text(size = 13),                          # axis title size
+      axis.text = element_text(size = 11)                            # axis tick label size
+    )
 
-fig1 <- ggplot(vif_df, aes(x = variable, y = VIF)) +
-  geom_col(fill = "grey30", width = 0.7) +
-  geom_hline(yintercept = 10, linetype = "dashed", color = "firebrick") +
-  coord_flip() +
-  scale_y_log10() +
-  labs(x = "Variable", y = expression("Variance Inflation Factor (" * log[10] * " scale)")) +
-  theme_paper +
-  theme(axis.text.y = element_text(size = 7))
+  save_fig <- function(plot, name, width, height) {                  # save a figure as PNG and PDF
+    ggsave(file.path(fig_dir, paste0(name, ".png")), plot, width = width, height = height,
+           dpi = 1600, units = "in", bg = "white")                   # high-resolution PNG
+    ggsave(file.path(fig_dir, paste0(name, ".pdf")), plot, width = width, height = height,
+           units = "in", device = cairo_pdf)                         # vector PDF
+  }
 
-save_fig(fig1, "Fig1_VIF_redundancy", width = 7, height = 9)
+  ## Figure 1: VIF
+  vif_df <- data.frame(variable = names(vif_vals), VIF = as.numeric(vif_vals))  # VIF data frame
+  vif_df$variable <- factor(vif_df$variable, levels = rev(vif_df$variable))     # keep sorted order in the plot
+  fig1 <- ggplot(vif_df, aes(x = variable, y = VIF)) +
+    geom_col(fill = "grey30", width = 0.7) +                         # bars
+    geom_hline(yintercept = 10, linetype = "dashed", color = "firebrick") +  # VIF = 10 reference line
+    coord_flip() +                                                   # horizontal bars
+    scale_y_log10() +                                                # log scale
+    labs(x = "Variable", y = expression("Variance Inflation Factor (" * log[10] * " scale)")) +
+    theme_paper +
+    theme(axis.text.y = element_text(size = 7))                      # small labels for 38 variables
+  save_fig(fig1, "Fig1_VIF_redundancy", width = 7, height = 9)
 
-## Figure 2
-domain_summary_clean <- domain_summary
-domain_summary_clean$domain <- domain_labels[domain_summary_clean$domain]
+  ## Figure 2: nominal vs effective dimensionality
+  domain_summary_clean <- domain_summary                             # copy
+  domain_summary_clean$domain <- domain_labels[domain_summary_clean$domain]  # clean domain names
+  dim_long <- pivot_longer(domain_summary_clean, cols = c(n_vars, effective_dim),
+                           names_to = "type", values_to = "count")   # long format
+  dim_long$type <- factor(dim_long$type, levels = c("n_vars", "effective_dim"),
+                          labels = c("Nominal variable count", "PCA-based effective dimensionality (95% variance)"))
+  fig2 <- ggplot(dim_long, aes(x = domain, y = count, fill = type)) +
+    geom_col(position = position_dodge(width = 0.7), width = 0.6) +  # side-by-side bars
+    scale_fill_manual(values = c("grey70", "grey25"), name = NULL) + # grey fills
+    labs(x = "Clinical domain", y = "Number of dimensions") +
+    theme_paper +
+    theme(axis.text.x = element_text(angle = 40, hjust = 1), legend.position = "top")
+  save_fig(fig2, "Fig2_domain_dimensionality", width = 8, height = 5.5)
 
-dim_long <- pivot_longer(domain_summary_clean, cols = c(n_vars, effective_dim),
-                          names_to = "type", values_to = "count")
-dim_long$type <- factor(dim_long$type, levels = c("n_vars", "effective_dim"),
-                         labels = c("Nominal variable count", "PCA-based effective dimensionality (95% variance)"))
+  ## Figure 3: importance vs U_j (extra right margin so labels fit)
+  importance_vs_uj_clean <- importance_vs_uj                         # copy
+  importance_vs_uj_clean$domain <- domain_labels[importance_vs_uj_clean$domain]  # clean domain names
+  fig3 <- ggplot(importance_vs_uj_clean, aes(x = importance, y = ridge_Uj, label = domain)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +  # zero line
+    geom_point(size = 3, color = "grey20") +                         # one point per domain
+    geom_text(vjust = -0.9, size = 3.3, color = "grey20") +          # domain labels
+    scale_x_continuous(expand = expansion(mult = c(0.05, 0.18))) +   # extra space on the right
+    labs(x = "Coefficient-based domain importance (sum of |standardized ridge coefficients|)",
+         y = expression(U[j] * " (unique predictive contribution, "*Delta*"log-loss)")) +
+    theme_paper
+  save_fig(fig3, "Fig3_importance_vs_Uj", width = 8, height = 6)
 
-fig2 <- ggplot(dim_long, aes(x = domain, y = count, fill = type)) +
-  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
-  scale_fill_manual(values = c("grey70", "grey25"), name = NULL) +
-  labs(x = "Clinical domain", y = "Number of dimensions") +
-  theme_paper +
-  theme(axis.text.x = element_text(angle = 40, hjust = 1),
-        legend.position = "top")
+  ## Figure 4: ridge vs XGBoost forest plot
+  ridge_fig <- ridge_boot_summary; xgb_fig <- xgb_boot_summary       # copies
+  ridge_fig$model <- "Ridge (linear)"                                # model label
+  xgb_fig$model   <- "XGBoost (nonlinear)"                           # model label
+  forest_df <- rbind(ridge_fig[, c("domain", "mean", "lo95", "hi95", "model")],
+                     xgb_fig[,   c("domain", "mean", "lo95", "hi95", "model")])  # stack both models
+  forest_df$model <- factor(forest_df$model, levels = c("Ridge (linear)", "XGBoost (nonlinear)"))
+  forest_df$domain <- domain_labels[forest_df$domain]                # clean domain names
+  domain_order <- domain_labels[importance_vs_uj$domain[order(importance_vs_uj$ridge_Uj)]]  # order by ridge U_j
+  forest_df$domain <- factor(forest_df$domain, levels = domain_order)
+  fig4 <- ggplot(forest_df, aes(x = domain, y = mean, ymin = lo95, ymax = hi95, color = model)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +  # zero line
+    geom_pointrange(position = position_dodge(width = 0.5), size = 0.6) +  # estimate with 95% CI
+    scale_color_manual(values = c("grey20", "steelblue4"), name = "Model class") +
+    coord_flip() +                                                   # horizontal layout
+    labs(x = "Clinical domain", y = expression(U[j] * " (95% bootstrap CI)")) +
+    theme_paper +
+    theme(legend.position = "top")
+  save_fig(fig4, "Fig4_ridge_vs_xgb_forest", width = 8, height = 6)
+  cat("\n=== 4 FIGURES SAVED ===\n")                                 # confirmation
+}
 
-save_fig(fig2, "Fig2_domain_dimensionality", width = 8, height = 5.5)
-
-## Figure 3 — DUZELTILDI: x-ekseninin sagina ekstra bosluk (expansion)
-## eklendi, boylece en sagdaki nokta olan "Bioimpedance" etiketi panel
-## kenarindan tasip kesilmiyor.
-importance_vs_uj_clean <- importance_vs_uj
-importance_vs_uj_clean$domain <- domain_labels[importance_vs_uj_clean$domain]
-
-fig3 <- ggplot(importance_vs_uj_clean, aes(x = importance, y = ridge_Uj, label = domain)) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
-  geom_point(size = 3, color = "grey20") +
-  geom_text(vjust = -0.9, size = 3.3, color = "grey20") +
-  scale_x_continuous(expand = expansion(mult = c(0.05, 0.18))) +
-  labs(x = "Coefficient-based domain importance (sum of |standardized ridge coefficients|)",
-       y = expression(U[j] * " (unique predictive contribution, "*Delta*"log-loss)")) +
-  theme_paper
-
-save_fig(fig3, "Fig3_importance_vs_Uj", width = 8, height = 6)
-
-## Figure 4
-ridge_boot_summary$model <- "Ridge (linear)"
-xgb_boot_summary$model   <- "XGBoost (nonlinear)"
-forest_df <- rbind(ridge_boot_summary, xgb_boot_summary)
-forest_df$model <- factor(forest_df$model, levels = c("Ridge (linear)", "XGBoost (nonlinear)"))
-forest_df$domain <- domain_labels[forest_df$domain]
-
-domain_order <- domain_labels[importance_vs_uj$domain[order(importance_vs_uj$ridge_Uj)]]
-forest_df$domain <- factor(forest_df$domain, levels = domain_order)
-
-fig4 <- ggplot(forest_df, aes(x = domain, y = mean, ymin = lo95, ymax = hi95, color = model)) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
-  geom_pointrange(position = position_dodge(width = 0.5), size = 0.6) +
-  scale_color_manual(values = c("grey20", "steelblue4"), name = "Model class") +
-  coord_flip() +
-  labs(x = "Clinical domain", y = expression(U[j] * " (95% bootstrap CI)")) +
-  theme_paper +
-  theme(legend.position = "top")
-
-save_fig(fig4, "Fig4_ridge_vs_xgb_forest", width = 8, height = 6)
-
-cat("\n=== 4 FIGUR KAYDEDILDI (Fig3 duzeltilmis) ===\n")
-save.image(file.path(proj_dir, "gallstone_analysis_workspace.RData"))
-cat("\n=== TUM ANALIZ TAMAMLANDI ===\n")
+save.image(file.path(proj_dir, "gallstone_analysis_workspace_v2.RData"))  # save the full workspace
+cat("\n=== ALL ANALYSES COMPLETE ===\n")
+cat("Files to send back: meanabs_rank_gap.csv, domain_size_confound_check.csv,\n",
+    "xgb_tuned_summary.csv, xgb_tuned_bootstrap_Uj.csv\n")           # reminder of what to send
