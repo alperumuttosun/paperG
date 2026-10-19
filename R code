@@ -1,12 +1,12 @@
 # ============================================================
-# GALLSTONE PAPER - R CODE  (r_gallstone_v2)
-# Cumulative script: your v7 code merged with the new analyses
-#   A) Mean |coefficient| per domain and the corresponding rank gap (fast)
-#   B) Importance vs domain-size correlation (confirms rho = 0.61)
-#   C) TUNED XGBoost bootstrap (inner CV tuning; ~30-90 min; resumable)
-# Heavy, already-completed analyses (nested ridge bootstrap, fixed-parameter
-# XGBoost bootstrap) are NOT re-run; their results are read from the existing
-# CSV files (RUN_OLD_HEAVY = FALSE).
+# GALLSTONE PAPER - R CODE  (r_gallstone_v4)
+# Cumulative script: your v7 code + all later analyses
+#   A) Mean |coefficient| per domain and rank gap          (done; fast, re-run)
+#   B) Importance vs domain-size correlation               (done; fast, re-run)
+#   C) Tuned XGBoost bootstrap                             (done; skipped, RUN_XGB_TUNED = FALSE)
+#   D) NEW: simulation study with known true U_j           (long; parallel; resumable)
+# Heavy, already-completed analyses are NOT re-run; their results are read
+# from the existing CSV files in the project folder.
 # ============================================================
 
 # ---- 0. Setup ----
@@ -25,9 +25,13 @@ invisible(lapply(pkgs, library, character.only = TRUE))              # load all 
 
 # ---- Switches ----
 RUN_OLD_HEAVY <- FALSE   # FALSE: old heavy results are read from CSV (recommended)
-RUN_XGB_TUNED <- TRUE    # TRUE: run the tuned XGBoost bootstrap (long)
+RUN_XGB_TUNED <- FALSE   # FALSE: tuned XGBoost bootstrap already done (CSV exists)
 B_xgb_tuned   <- 200     # number of bootstrap replicates for tuned XGBoost (set 20 for a quick test)
-MAKE_FIGURES  <- TRUE    # TRUE: regenerate Figures 1-4
+MAKE_FIGURES  <- FALSE   # FALSE: Figures 1-4 already made (set TRUE to redraw)
+RUN_SIM       <- TRUE    # TRUE: run the simulation study (long)
+R_sim         <- 50      # replications per scenario x correlation cell (set 3 for a quick test)
+B_sim         <- 20      # bootstrap iterations per replication for estimated U_j
+n_cores       <- max(1, parallel::detectCores() - 1)  # CPU cores used for the simulation
 
 set.seed(2026)                                                       # global seed for reproducibility
 
@@ -432,7 +436,185 @@ if (MAKE_FIGURES) {
   cat("\n=== 4 FIGURES SAVED ===\n")                                 # confirmation
 }
 
-save.image(file.path(proj_dir, "gallstone_analysis_workspace_v2.RData"))  # save the full workspace
+# ================== NEW D) SIMULATION STUDY ==================
+if (RUN_SIM) {
+  library(parallel)                                                  # parallel computing
+  dom_sizes <- c(D = 2, A = 3, C = 5, B = 14, L = 4, M = 5, R = 2, I = 1, H = 1, V = 1)  # same sizes as the real domains
+  sim_dom   <- rep(names(dom_sizes), dom_sizes)                      # domain label of each simulated variable
+  sim_p     <- sum(dom_sizes)                                        # total number of simulated variables (38)
+  rb        <- 0.3                                                   # correlation between domain latent factors
+  scen_list <- c("S1_shared", "S2_unique_small", "S3_nonlinear")     # three data-generating scenarios
+  rw_grid   <- c(0.3, 0.6, 0.9)                                      # within-domain correlation levels
+  sim_n     <- 319                                                   # sample size (as in the real data)
+  xgb_params_sim <- list(objective = "binary:logistic", max_depth = 2, eta = 0.08,
+                         subsample = 0.8, colsample_bytree = 0.8, lambda = 2,
+                         eval_metric = "logloss", nthread = 1)       # fixed XGBoost settings (one thread per worker)
+
+  # Generate one simulated data set (X, y) for a scenario and within-domain correlation
+  gen_data <- function(n, rw, scen, seed) {
+    set.seed(seed)                                                   # reproducible data
+    g <- rnorm(n)                                                    # common factor shared by all domains
+    Z <- sapply(names(dom_sizes), function(d) sqrt(rb) * g + sqrt(1 - rb) * rnorm(n))  # one latent factor per domain
+    colnames(Z) <- names(dom_sizes)                                  # name the latent factors
+    Xs <- matrix(NA_real_, n, sim_p)                                 # storage for observed variables
+    for (j in seq_len(sim_p)) {                                      # build each observed variable
+      d  <- sim_dom[j]                                               # domain of variable j
+      ld <- if (dom_sizes[d] == 1) sqrt(0.7) else sqrt(rw)           # loading on the latent factor
+      Xs[, j] <- ld * Z[, d] + sqrt(1 - ld^2) * rnorm(n)             # observed = loading*latent + noise
+    }
+    colnames(Xs) <- paste0(sim_dom, seq_len(sim_p))                  # variable names
+    eta <- switch(scen,                                              # linear predictor of the outcome
+      S1_shared       = 1.2 * g,                                     # S1: signal shared by all domains (redundant)
+      S2_unique_small = 0.5 * g + 0.9 * Z[, "V"] + 0.9 * Z[, "I"],   # S2: unique signal in two single-variable domains
+      S3_nonlinear    = 0.5 * g + 0.9 * Z[, "I"] + 1.0 * (Z[, "B"]^2 - 1))  # S3: nonlinear signal in the large domain
+    y <- rbinom(n, 1, plogis(eta))                                   # binary outcome
+    list(X = Xs, y = y)
+  }
+
+  # Ridge learner: inner CV picks lambda, returns test log-loss
+  fit_ridge_ll <- function(Xtr, ytr, Xte, yte) {
+    ctr <- colMeans(Xtr); scl <- apply(Xtr, 2, sd); scl[scl == 0] <- 1   # training means and SDs
+    A <- scale(Xtr, ctr, scl); Bm <- scale(Xte, ctr, scl)            # standardize train and test
+    cv <- cv.glmnet(A, ytr, family = "binomial", alpha = 0, nfolds = 5)  # inner 5-fold CV for lambda
+    p  <- as.numeric(predict(cv, newx = Bm, s = "lambda.min", type = "response"))  # predicted probabilities
+    logloss(yte, p)                                                  # test log-loss
+  }
+
+  # XGBoost learner with fixed settings, returns test log-loss
+  fit_xgb_ll <- function(Xtr, ytr, Xte, yte) {
+    fit <- xgb.train(params = xgb_params_sim, data = xgb.DMatrix(Xtr, label = ytr), nrounds = 150, verbose = 0)  # fit
+    logloss(yte, predict(fit, xgb.DMatrix(Xte)))                     # test log-loss
+  }
+
+  # Estimated U_j by out-of-bag bootstrap (mean over B iterations)
+  est_uj <- function(X, y, learner, B) {
+    n <- nrow(X)                                                     # sample size
+    out <- matrix(0, B, length(dom_sizes), dimnames = list(NULL, names(dom_sizes)))  # storage
+    cnt <- 0                                                         # number of valid iterations
+    for (b in seq_len(B)) {
+      bi <- sample.int(n, n, replace = TRUE)                         # bootstrap training indices
+      oi <- setdiff(seq_len(n), unique(bi))                          # out-of-bag indices
+      if (length(oi) < 15) next                                      # skip if OOB too small
+      full <- learner(X[bi, ], y[bi], X[oi, ], y[oi])                # full-model OOB loss
+      for (d in names(dom_sizes)) {                                  # remove each domain in turn
+        keep <- sim_dom != d                                         # columns that remain
+        out[b, d] <- learner(X[bi, keep], y[bi], X[oi, keep], y[oi]) - full  # U_j for this iteration
+      }
+      cnt <- cnt + 1                                                 # count valid iteration
+    }
+    colSums(out) / cnt                                               # bootstrap mean U_j per domain
+  }
+
+  # Coefficient-based importance: summed and mean |standardized ridge coefficient| per domain
+  importance_sim <- function(X, y) {
+    A  <- scale(X)                                                   # standardize
+    cv <- cv.glmnet(A, y, family = "binomial", alpha = 0, nfolds = 5)  # ridge with CV lambda
+    b  <- abs(as.numeric(coef(cv, s = "lambda.min"))[-1])            # absolute coefficients without intercept
+    list(sum  = tapply(b, sim_dom, sum)[names(dom_sizes)],           # summed importance per domain
+         mean = tapply(b, sim_dom, mean)[names(dom_sizes)])          # mean importance per domain
+  }
+
+  # True (population) U_j for a learner: large training and test samples
+  pop_uj <- function(scen, rw, learner, N = 20000) {
+    tr <- gen_data(N, rw, scen, seed = 900001)                       # large training sample
+    te <- gen_data(N, rw, scen, seed = 900002)                       # large independent test sample
+    full <- learner(tr$X, tr$y, te$X, te$y)                          # full-model test loss
+    sapply(names(dom_sizes), function(d) {
+      keep <- sim_dom != d                                           # columns that remain
+      learner(tr$X[, keep], tr$y, te$X[, keep], te$y) - full         # true U_j of domain d
+    })
+  }
+
+  # One replication: simulate data, compute importance and estimated U_j (ridge and XGBoost)
+  run_rep <- function(task) {
+    seed <- 100000 + 10000 * match(task$scen, scen_list) + 1000 * match(task$rw, rw_grid) + task$rep  # unique seed
+    dat  <- gen_data(sim_n, task$rw, task$scen, seed)                # simulated data
+    imp  <- importance_sim(dat$X, dat$y)                             # coefficient-based importance
+    data.frame(scen = task$scen, rw = task$rw, rep = task$rep, domain = names(dom_sizes),
+               sum_abs = as.numeric(imp$sum), mean_abs = as.numeric(imp$mean),
+               uj_ridge = est_uj(dat$X, dat$y, fit_ridge_ll, B_sim), # estimated U_j, ridge
+               uj_xgb   = est_uj(dat$X, dat$y, fit_xgb_ll,   B_sim), # estimated U_j, XGBoost
+               row.names = NULL)
+  }
+
+  # Start workers
+  cl <- NULL
+  if (n_cores > 1) {
+    cl <- makeCluster(n_cores)                                       # start the cluster
+    clusterEvalQ(cl, { library(glmnet); library(xgboost) })          # load packages on workers
+    clusterExport(cl, c("dom_sizes", "sim_dom", "sim_p", "rb", "scen_list", "rw_grid", "sim_n", "B_sim",
+                        "xgb_params_sim", "gen_data", "fit_ridge_ll", "fit_xgb_ll", "est_uj",
+                        "importance_sim", "run_rep", "logloss"))     # copy objects to workers
+  }
+
+  # Loop over scenario x within-domain correlation cells (each cell is saved, so the run is resumable)
+  all_rep <- list(); truth_list <- list()
+  for (sc in scen_list) for (rw in rw_grid) {
+    cell_file <- sprintf("sim_cell_%s_rw%.1f.rds", sc, rw)           # checkpoint file for this cell
+    if (file.exists(cell_file)) {                                    # cell already done
+      cell <- readRDS(cell_file); cat("Loaded", cell_file, "\n")
+    } else {
+      t0 <- Sys.time()                                               # start time
+      tr_ridge <- pop_uj(sc, rw, fit_ridge_ll)                       # true U_j, ridge class
+      tr_xgb   <- pop_uj(sc, rw, fit_xgb_ll)                         # true U_j, XGBoost class
+      tasks <- lapply(seq_len(R_sim), function(r) list(scen = sc, rw = rw, rep = r))  # replication tasks
+      res <- if (is.null(cl)) lapply(tasks, run_rep) else parLapply(cl, tasks, run_rep)  # run replications
+      reps <- do.call(rbind, res)                                    # stack replications
+      reps$truth_ridge <- tr_ridge[reps$domain]                      # attach true U_j (ridge)
+      reps$truth_xgb   <- tr_xgb[reps$domain]                        # attach true U_j (XGBoost)
+      cell <- reps
+      saveRDS(cell, cell_file)                                       # save checkpoint
+      cat(sprintf("Cell %s rw=%.1f done in %.1f min\n", sc, rw, as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+    }
+    all_rep[[length(all_rep) + 1]] <- cell
+  }
+  if (!is.null(cl)) stopCluster(cl)                                  # stop workers
+  sim_rep <- do.call(rbind, all_rep)                                 # all replications together
+  write.csv(sim_rep, "sim_replicates.csv", row.names = FALSE)        # OUTPUT: raw simulation results
+
+  # True U_j table (one row per scenario x rw x domain)
+  truth_tab <- unique(sim_rep[, c("scen", "rw", "domain", "truth_ridge", "truth_xgb")])
+  write.csv(truth_tab, "sim_truth_Uj.csv", row.names = FALSE)        # OUTPUT: true U_j values
+
+  # Performance measures per replication, then averaged
+  sp <- function(a, b) suppressWarnings(cor(a, b, method = "spearman"))  # Spearman correlation (NA if constant)
+  perf <- do.call(rbind, lapply(split(sim_rep, list(sim_rep$scen, sim_rep$rw, sim_rep$rep), drop = TRUE), function(d) {
+    data.frame(scen = d$scen[1], rw = d$rw[1], rep = d$rep[1],
+      sp_sum_ridge  = sp(d$sum_abs,  d$truth_ridge), sp_mean_ridge = sp(d$mean_abs, d$truth_ridge),   # importance vs true U_j (ridge)
+      sp_uhat_ridge = sp(d$uj_ridge, d$truth_ridge),                                                  # estimated vs true U_j (ridge)
+      sp_sum_xgb    = sp(d$sum_abs,  d$truth_xgb),   sp_mean_xgb   = sp(d$mean_abs, d$truth_xgb),     # importance vs true U_j (XGBoost)
+      sp_uhat_xgb   = sp(d$uj_xgb,   d$truth_xgb),                                                    # estimated vs true U_j (XGBoost)
+      sp_ridge_vs_xgb = sp(d$uj_ridge, d$uj_xgb),                                                     # ridge vs XGBoost estimates
+      sp_true_ridge_vs_xgb = sp(d$truth_ridge, d$truth_xgb),                                          # ridge vs XGBoost truths
+      bias_ridge = mean(d$uj_ridge - d$truth_ridge), bias_xgb = mean(d$uj_xgb - d$truth_xgb))         # mean bias of estimated U_j
+  }))
+  write.csv(perf, "sim_performance_by_rep.csv", row.names = FALSE)   # OUTPUT: per-replication performance
+  num_cols <- setdiff(names(perf), c("scen", "rw", "rep"))           # performance columns
+  sim_summary <- aggregate(perf[, num_cols], by = list(scen = perf$scen, rw = perf$rw), FUN = function(v) mean(v, na.rm = TRUE))  # means
+  sim_summary_sd <- aggregate(perf[, num_cols], by = list(scen = perf$scen, rw = perf$rw), FUN = function(v) sd(v, na.rm = TRUE))  # SDs
+  names(sim_summary_sd)[-(1:2)] <- paste0(names(sim_summary_sd)[-(1:2)], "_sd")  # label SD columns
+  sim_summary <- merge(sim_summary, sim_summary_sd, by = c("scen", "rw"))        # combine means and SDs
+  write.csv(sim_summary, "sim_summary.csv", row.names = FALSE)       # OUTPUT: summary table
+  cat("\n--- Simulation summary (mean Spearman with true U_j) ---\n"); print(sim_summary[, c("scen", "rw", "sp_sum_ridge", "sp_mean_ridge", "sp_uhat_ridge", "sp_sum_xgb", "sp_mean_xgb", "sp_uhat_xgb", "sp_ridge_vs_xgb")])
+
+  # Figure 5: agreement with true U_j by scenario and within-domain correlation (ridge truth)
+  fig5_df <- do.call(rbind, list(
+    data.frame(sim_summary[, c("scen", "rw")], measure = "Summed |coef|",  rho = sim_summary$sp_sum_ridge),
+    data.frame(sim_summary[, c("scen", "rw")], measure = "Mean |coef|",    rho = sim_summary$sp_mean_ridge),
+    data.frame(sim_summary[, c("scen", "rw")], measure = "Estimated U_j (ridge)", rho = sim_summary$sp_uhat_ridge)))
+  fig5 <- ggplot(fig5_df, aes(x = rw, y = rho, color = measure, linetype = measure)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +   # zero agreement line
+    geom_line(linewidth = 0.8) + geom_point(size = 2) +                  # lines and points
+    facet_wrap(~ scen) +                                                 # one panel per scenario
+    scale_color_manual(values = c("grey60", "grey35", "steelblue4"), name = NULL) +  # colours
+    scale_linetype_manual(values = c("solid", "dashed", "solid"), name = NULL) +     # line types
+    labs(x = "Within-domain correlation", y = "Mean Spearman correlation with true U_j") +  # axis labels
+    theme_classic(base_size = 13) + theme(legend.position = "top")       # clean theme
+  ggsave(file.path(fig_dir, "Fig5_simulation.png"), fig5, width = 9, height = 4, dpi = 600, units = "in", bg = "white")  # save PNG
+  ggsave(file.path(fig_dir, "Fig5_simulation.pdf"), fig5, width = 9, height = 4, units = "in", device = cairo_pdf)       # save PDF
+}
+
+save.image(file.path(proj_dir, "gallstone_analysis_workspace_v4.RData"))  # save the full workspace
 cat("\n=== ALL ANALYSES COMPLETE ===\n")
-cat("Files to send back: meanabs_rank_gap.csv, domain_size_confound_check.csv,\n",
-    "xgb_tuned_summary.csv, xgb_tuned_bootstrap_Uj.csv\n")           # reminder of what to send
+cat("Files to send back: sim_summary.csv, sim_truth_Uj.csv, sim_performance_by_rep.csv,\n",
+    "sim_replicates.csv (and Fig5_simulation.png from the figures folder)\n")  # reminder of what to send
